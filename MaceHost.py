@@ -15,47 +15,72 @@ import os
 import re
 import secrets
 import sqlite3
+import warnings
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # Optional locally; required when DATABASE_URL is PostgreSQL.
+    psycopg = None
+    dict_row = None
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
-DATABASE_PATH = Path(os.environ.get("MACE_ACCOUNTS_DB", str(BASE_DIR / "mace_accounts.db")))
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+_USE_POSTGRES = DATABASE_URL.lower().startswith(("postgres://", "postgresql://"))
+if DATABASE_URL and not _USE_POSTGRES:
+    raise RuntimeError("DATABASE_URL must be a PostgreSQL connection URL (postgresql://...).")
+if _USE_POSTGRES and psycopg is None:
+    raise RuntimeError("DATABASE_URL is set to PostgreSQL, but psycopg is missing. Install requirements.txt.")
+
+# Local development defaults to a database beside the source. On hosted runtimes
+# without DATABASE_URL, use /tmp so a read-only /app directory does not crash boot.
+# /tmp is ephemeral: use Hostless managed PostgreSQL + DATABASE_URL for real accounts.
+_configured_db_path = os.environ.get("MACE_ACCOUNTS_DB", "").strip()
+if _configured_db_path:
+    DATABASE_PATH = Path(_configured_db_path).expanduser()
+elif os.environ.get("PORT") and not _USE_POSTGRES:
+    DATABASE_PATH = Path(os.environ.get("MACE_TEMP_DB_PATH", "/tmp/mace_accounts.db"))
+    warnings.warn(
+        "DATABASE_URL is not configured. MaceHost is using temporary SQLite at "
+        f"{DATABASE_PATH}; accounts may be lost after a restart or redeploy. "
+        "Connect a managed PostgreSQL database for persistent accounts.",
+        RuntimeWarning,
+    )
+else:
+    DATABASE_PATH = BASE_DIR / "mace_accounts.db"
+
 PBKDF2_ROUNDS = 310_000
 SESSION_SECONDS = 60 * 60 * 24 * 30
 
 app = FastAPI(
     title="MaceHost — Mace Accounts API",
     description="Unified accounts, profiles, and friends for Mace Launcher.",
-    version="1.0.0",
+    version="1.1.0",
 )
 
-# Browser account pages run on Render while the API is hosted separately.
-# Explicitly retain the real website origin even if the hosting dashboard has
-# MACE_ALLOWED_ORIGINS configured with an outdated or incomplete list.
-# The API uses Bearer tokens, not cross-origin cookies, so credentials stay off.
-_REQUIRED_WEB_ORIGINS = [
-    "https://mace-launcher.onrender.com",
-]
+# Access tokens are sent explicitly as Bearer tokens; cookies are not used.
+# For production, set MACE_ALLOWED_ORIGINS to a comma-separated allow-list.
 _origins_env = os.environ.get("MACE_ALLOWED_ORIGINS", "").strip()
-_configured_origins = [item.strip().rstrip("/") for item in _origins_env.split(",") if item.strip()]
-if _origins_env:
-    _allowed_origins = list(dict.fromkeys(_REQUIRED_WEB_ORIGINS + _configured_origins))
-else:
-    # Public account API: no browser cookies are used; token auth is explicit.
-    _allowed_origins = ["*"]
+_allowed_origins = [item.strip() for item in _origins_env.split(",") if item.strip()] if _origins_env else ["*"]
+# Always permit the public Mace Launcher website even when a custom allow-list is set.
+_site_origin = "https://mace-launcher.onrender.com"
+if "*" not in _allowed_origins and _site_origin not in _allowed_origins:
+    _allowed_origins.append(_site_origin)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
     allow_credentials=False,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Accept", "Origin"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
     max_age=600,
 )
 
@@ -79,8 +104,76 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+class _PostgresCursor:
+    """Small adapter preserving the sqlite-style API used by this service."""
+    def __init__(self, cursor, lastrowid=None, prefetched=None):
+        self._cursor = cursor
+        self.lastrowid = lastrowid
+        self._prefetched = prefetched
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    def fetchone(self):
+        if self._prefetched is not None:
+            row, self._prefetched = self._prefetched, None
+            return row
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        rows = self._cursor.fetchall()
+        if self._prefetched is not None:
+            rows.insert(0, self._prefetched)
+            self._prefetched = None
+        return rows
+
+
+class _PostgresConnection:
+    def __init__(self, connection):
+        self._connection = connection
+
+    def execute(self, sql: str, params=()):
+        statement = sql.strip()
+        # Translate the small subset of SQLite SQL used by this API to PostgreSQL.
+        statement = re.sub(r"^INSERT\s+OR\s+IGNORE\s+INTO\s+", "INSERT INTO ", statement, flags=re.I)
+        has_ignore = bool(re.match(r"^INSERT\s+OR\s+IGNORE\s+INTO\s+", sql.strip(), flags=re.I))
+        statement = statement.replace("?", "%s")
+        table_match = re.match(r"^INSERT\s+INTO\s+(users|friend_requests)\b", statement, flags=re.I)
+        wants_id = bool(table_match) and " RETURNING " not in statement.upper()
+        if wants_id:
+            statement = statement.rstrip().rstrip(";") + " RETURNING id"
+        if has_ignore:
+            statement = statement.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+        cur = self._connection.cursor()
+        cur.execute(statement, tuple(params or ()))
+        if wants_id:
+            row = cur.fetchone()
+            return _PostgresCursor(cur, lastrowid=(row["id"] if row else None))
+        return _PostgresCursor(cur)
+
+    def executescript(self, script: str):
+        # Schema contains independent CREATE TABLE/INDEX statements only.
+        for statement in script.split(";"):
+            if statement.strip():
+                self.execute(statement)
+
+
 @contextmanager
 def database():
+    if _USE_POSTGRES:
+        # psycopg dict_row lets existing API code keep accessing row["column"].
+        conn = psycopg.connect(DATABASE_URL.replace("postgres://", "postgresql://", 1), row_factory=dict_row, connect_timeout=10)
+        try:
+            yield _PostgresConnection(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return
+
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DATABASE_PATH), timeout=15)
     conn.row_factory = sqlite3.Row
@@ -97,55 +190,58 @@ def database():
 
 
 def init_db() -> None:
+    schema = """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mace_id TEXT NOT NULL UNIQUE,
+            username TEXT NOT NULL,
+            username_key TEXT NOT NULL UNIQUE,
+            email TEXT NOT NULL,
+            email_key TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            token_hash TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            expires_at INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
+        CREATE TABLE IF NOT EXISTS friend_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            requester_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            recipient_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            responded_at TEXT,
+            CHECK(requester_id <> recipient_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_friend_requests_recipient_status
+            ON friend_requests(recipient_id, status);
+        CREATE INDEX IF NOT EXISTS idx_friend_requests_requester_status
+            ON friend_requests(requester_id, status);
+        CREATE TABLE IF NOT EXISTS friendships (
+            user_a_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            user_b_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(user_a_id, user_b_id),
+            CHECK(user_a_id < user_b_id)
+        );
+        CREATE TABLE IF NOT EXISTS blocks (
+            blocker_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            blocked_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(blocker_id, blocked_id),
+            CHECK(blocker_id <> blocked_id)
+        );
+        """
+    if _USE_POSTGRES:
+        # SERIAL primary keys + BIGINT foreign keys are native PostgreSQL types.
+        schema = schema.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+        schema = re.sub(r"\bINTEGER NOT NULL REFERENCES", "BIGINT NOT NULL REFERENCES", schema)
     with database() as db:
-        db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                mace_id TEXT NOT NULL UNIQUE,
-                username TEXT NOT NULL,
-                username_key TEXT NOT NULL UNIQUE,
-                email TEXT NOT NULL,
-                email_key TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS sessions (
-                token_hash TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                expires_at INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
-            CREATE TABLE IF NOT EXISTS friend_requests (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                requester_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                recipient_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TEXT NOT NULL,
-                responded_at TEXT,
-                CHECK(requester_id <> recipient_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_friend_requests_recipient_status
-                ON friend_requests(recipient_id, status);
-            CREATE INDEX IF NOT EXISTS idx_friend_requests_requester_status
-                ON friend_requests(requester_id, status);
-            CREATE TABLE IF NOT EXISTS friendships (
-                user_a_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                user_b_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY(user_a_id, user_b_id),
-                CHECK(user_a_id < user_b_id)
-            );
-            CREATE TABLE IF NOT EXISTS blocks (
-                blocker_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                blocked_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY(blocker_id, blocked_id),
-                CHECK(blocker_id <> blocked_id)
-            );
-            """
-        )
+        db.executescript(schema)
 
 
 init_db()
@@ -225,7 +321,13 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "MaceHost", "api_version": "1.0.0"}
+    return {
+        "ok": True,
+        "service": "MaceHost",
+        "api_version": "1.1.0",
+        "database": "postgresql" if _USE_POSTGRES else "sqlite",
+        "persistent_database": bool(_USE_POSTGRES or os.environ.get("MACE_ACCOUNTS_DB")),
+    }
 
 
 @app.post("/register")
@@ -249,7 +351,7 @@ def register(body: RegisterBody):
             )
             user_id = int(cur.lastrowid)
             token = _new_session(db, user_id)
-    except sqlite3.IntegrityError:
+    except ((sqlite3.IntegrityError,) + ((psycopg.IntegrityError,) if _USE_POSTGRES else ())):
         with database() as db:
             if db.execute("SELECT 1 FROM users WHERE username_key=?", (username_key,)).fetchone():
                 raise HTTPException(status_code=409, detail="Это имя уже занято.")
