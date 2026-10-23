@@ -20,13 +20,13 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
 BASE_DIR = Path(__file__).resolve().parent
-DATABASE_PATH = Path(os.environ.get("MACE_ACCOUNTS_DB", str(BASE_DIR / "mace_accounts.db")))
+DATABASE_PATH = BASE_DIR / "mace.db"
+
+DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 PBKDF2_ROUNDS = 310_000
 SESSION_SECONDS = 60 * 60 * 24 * 30
 
