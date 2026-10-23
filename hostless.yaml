@@ -1,5 +1,7 @@
 build:
-command: "pip install -r requirements.txt"
+  command: "pip install -r requirements.txt"
+  system: railpack
+start_command: "python -m uvicorn MaceHost:app --host 0.0.0.0 --port $PORT"
 system: railpack
 min_cpu: 0.1
 max_cpu: 0.5
