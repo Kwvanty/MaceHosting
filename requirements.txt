@@ -2,3 +2,4 @@ fastapi>=0.110,<1
 uvicorn[standard]>=0.29,<1
 pydantic>=2.7,<3
 psycopg[binary]>=3.2,<4
+python-multipart>=0.0.9,<1
