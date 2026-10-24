@@ -17,6 +17,9 @@ import secrets
 import sqlite3
 import warnings
 import time
+import uuid
+import mimetypes
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,7 +32,8 @@ except ImportError:  # Optional locally; required when DATABASE_URL is PostgreSQ
     psycopg = None
     dict_row = None
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, UploadFile, File, Form
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -64,7 +68,7 @@ SESSION_SECONDS = 60 * 60 * 24 * 30
 app = FastAPI(
     title="MaceHost — Mace Accounts API",
     description="Unified accounts, profiles, and friends for Mace Launcher.",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 # Access tokens are sent explicitly as Bearer tokens; cookies are not used.
@@ -79,7 +83,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Accept"],
     max_age=600,
 )
@@ -98,6 +102,21 @@ class LoginBody(BaseModel):
 
 class FriendTargetBody(BaseModel):
     mace_id: str = Field(min_length=3, max_length=40)
+
+
+class PresenceBody(BaseModel):
+    status: str = Field(default="launcher", pattern="^(offline|launcher|minecraft)$")
+    game_version: str = Field(default="", max_length=32)
+    playtime_delta: int = Field(default=0, ge=0, le=60)
+
+
+class ProfileUpdateBody(BaseModel):
+    display_name: str = Field(default="", max_length=32)
+    bio: str = Field(default="", max_length=240)
+
+
+class ChatMessageBody(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
 
 
 def utc_now() -> str:
@@ -246,6 +265,67 @@ def init_db() -> None:
 
 init_db()
 
+# Social extensions are separate tables so existing accounts migrate without data loss.
+_SOCIAL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS user_profiles (
+    user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    display_name TEXT NOT NULL DEFAULT '',
+    bio TEXT NOT NULL DEFAULT '',
+    minecraft_seconds BIGINT NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS presence (
+    user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'offline',
+    last_seen BIGINT NOT NULL DEFAULT 0,
+    game_version TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS attachments (
+    file_id TEXT PRIMARY KEY,
+    owner_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    recipient_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    purpose TEXT NOT NULL,
+    original_name TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    file_size BIGINT NOT NULL DEFAULT 0,
+    stored_path TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    expires_at BIGINT,
+    deleted INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_expiry ON attachments(expires_at, deleted);
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    recipient_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    text TEXT NOT NULL DEFAULT '',
+    attachment_id TEXT REFERENCES attachments(file_id) ON DELETE SET NULL,
+    message_type TEXT NOT NULL DEFAULT 'text',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_pair ON messages(sender_id, recipient_id, id);
+CREATE TABLE IF NOT EXISTS profile_screenshots (
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    attachment_id TEXT NOT NULL UNIQUE REFERENCES attachments(file_id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(user_id, attachment_id)
+);
+"""
+if _USE_POSTGRES:
+    _SOCIAL_SCHEMA = _SOCIAL_SCHEMA.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+with database() as _db:
+    _db.executescript(_SOCIAL_SCHEMA)
+
+if os.environ.get("MACE_UPLOAD_DIR"):
+    UPLOAD_DIR = Path(os.environ["MACE_UPLOAD_DIR"]).expanduser()
+elif os.environ.get("PORT"):
+    UPLOAD_DIR = Path(os.environ.get("MACE_TEMP_DB_PATH", "/tmp/mace_accounts.db")).parent / "mace_uploads"
+else:
+    UPLOAD_DIR = BASE_DIR / "mace_uploads"
+MAX_UPLOAD_BYTES = max(1, int(os.environ.get("MACE_MAX_UPLOAD_MB", "100"))) * 1024 * 1024
+CHAT_FILE_LIFETIME_SECONDS = 60 * 60
+PRESENCE_STALE_SECONDS = 90
+
 
 def _hash_password(password: str, salt_hex: Optional[str] = None) -> str:
     salt = bytes.fromhex(salt_hex) if salt_hex else secrets.token_bytes(16)
@@ -272,11 +352,18 @@ def _new_session(db: sqlite3.Connection, user_id: int) -> str:
 
 
 def _public_user(row: sqlite3.Row) -> dict:
+    keys = set(row.keys()) if hasattr(row, "keys") else set(row) if isinstance(row, dict) else set()
+    status = str(row["presence_status"] or "offline") if "presence_status" in keys else "offline"
+    seen = int(row["presence_last_seen"] or 0) if "presence_last_seen" in keys else 0
+    if not seen or time.time() - seen > PRESENCE_STALE_SECONDS:
+        status = "offline"
     return {
         "mace_id": row["mace_id"],
         "username": row["username"],
         "created_at": row["created_at"],
         "avatar_url": None,
+        "status": status if status in ("offline", "launcher", "minecraft") else "offline",
+        "game_version": str(row["presence_game_version"] or "") if "presence_game_version" in keys else "",
     }
 
 
@@ -324,7 +411,7 @@ def health():
     return {
         "ok": True,
         "service": "MaceHost",
-        "api_version": "1.1.0",
+        "api_version": "1.2.0",
         "database": "postgresql" if _USE_POSTGRES else "sqlite",
         "persistent_database": bool(_USE_POSTGRES or os.environ.get("MACE_ACCOUNTS_DB")),
     }
@@ -379,13 +466,7 @@ def login(body: LoginBody):
 
 @app.get("/me")
 def me(user: dict = Depends(current_user)):
-    return {
-        "username": user["username"],
-        "mace_id": user["mace_id"],
-        "email": user["email"],
-        "created_at": user["created_at"],
-        "avatar_url": None,
-    }
+    return _profile_payload(user, include_email=True)
 
 
 @app.post("/logout")
@@ -404,7 +485,8 @@ def search_users(q: str = Query(default="", max_length=80), user: dict = Depends
         return {"users": []}
     with database() as db:
         rows = db.execute(
-            """SELECT u.* FROM users u
+            """SELECT u.*, p.status AS presence_status, p.last_seen AS presence_last_seen, p.game_version AS presence_game_version
+               FROM users u LEFT JOIN presence p ON p.user_id=u.id
                WHERE u.id<>? AND (u.username_key LIKE ? OR upper(u.mace_id) LIKE upper(?))
                  AND NOT EXISTS (
                     SELECT 1 FROM blocks b WHERE
@@ -455,20 +537,24 @@ def get_friends(user: dict = Depends(current_user)):
     me_id = int(user["id"])
     with database() as db:
         friends_rows = db.execute(
-            """SELECT u.* FROM friendships f JOIN users u ON u.id =
+            """SELECT u.*, p.status AS presence_status, p.last_seen AS presence_last_seen, p.game_version AS presence_game_version
+               FROM friendships f JOIN users u ON u.id =
                CASE WHEN f.user_a_id=? THEN f.user_b_id ELSE f.user_a_id END
+               LEFT JOIN presence p ON p.user_id=u.id
                WHERE f.user_a_id=? OR f.user_b_id=? ORDER BY u.username_key""",
             (me_id, me_id, me_id),
         ).fetchall()
         incoming_rows = db.execute(
-            """SELECT fr.id AS request_id, fr.created_at, u.* FROM friend_requests fr
-               JOIN users u ON u.id=fr.requester_id
+            """SELECT fr.id AS request_id, fr.created_at, u.*, p.status AS presence_status, p.last_seen AS presence_last_seen, p.game_version AS presence_game_version
+               FROM friend_requests fr JOIN users u ON u.id=fr.requester_id
+               LEFT JOIN presence p ON p.user_id=u.id
                WHERE fr.recipient_id=? AND fr.status='pending' ORDER BY fr.created_at DESC""",
             (me_id,),
         ).fetchall()
         outgoing_rows = db.execute(
-            """SELECT fr.id AS request_id, fr.created_at, u.* FROM friend_requests fr
-               JOIN users u ON u.id=fr.recipient_id
+            """SELECT fr.id AS request_id, fr.created_at, u.*, p.status AS presence_status, p.last_seen AS presence_last_seen, p.game_version AS presence_game_version
+               FROM friend_requests fr JOIN users u ON u.id=fr.recipient_id
+               LEFT JOIN presence p ON p.user_id=u.id
                WHERE fr.requester_id=? AND fr.status='pending' ORDER BY fr.created_at DESC""",
             (me_id,),
         ).fetchall()
@@ -552,6 +638,308 @@ def unblock_user(mace_id: str, user: dict = Depends(current_user)):
         if not target:
             raise HTTPException(status_code=404, detail="Пользователь не найден.")
         db.execute("DELETE FROM blocks WHERE blocker_id=? AND blocked_id=?", (int(user["id"]), int(target["id"])))
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Mace Social: profiles, presence, chats and time-limited file transfer
+# ---------------------------------------------------------------------------
+def _ensure_user_profile(db, user_id: int) -> None:
+    db.execute(
+        "INSERT OR IGNORE INTO user_profiles(user_id,display_name,bio,minecraft_seconds,updated_at) VALUES (?,?,?,?,?)",
+        (int(user_id), "", "", 0, utc_now()),
+    )
+
+def _effective_presence(status: str, last_seen: int) -> str:
+    if not last_seen or int(time.time()) - int(last_seen) > PRESENCE_STALE_SECONDS:
+        return "offline"
+    return status if status in ("launcher", "minecraft") else "offline"
+
+def _attachment_public(row, *, include_expired=True) -> dict:
+    file_id = row["file_id"]
+    expired = bool(row["deleted"]) or (row["expires_at"] is not None and int(row["expires_at"]) <= int(time.time()))
+    if expired and not include_expired:
+        return {}
+    return {
+        "file_id": file_id, "filename": row["original_name"], "content_type": row["content_type"],
+        "file_size": int(row["file_size"] or 0), "purpose": row["purpose"],
+        "created_at": row["created_at"], "expires_at": row["expires_at"], "expired": expired,
+        "download_url": f"/files/{file_id}" if not expired else None,
+    }
+
+def _profile_payload(user: dict, include_email: bool = False) -> dict:
+    user_id = int(user["id"])
+    with database() as db:
+        _ensure_user_profile(db, user_id)
+        prof = db.execute("SELECT * FROM user_profiles WHERE user_id=?", (user_id,)).fetchone()
+        presence = db.execute("SELECT status,last_seen,game_version FROM presence WHERE user_id=?", (user_id,)).fetchone()
+        shot_rows = db.execute(
+            "SELECT a.* FROM profile_screenshots s JOIN attachments a ON a.file_id=s.attachment_id WHERE s.user_id=? ORDER BY s.created_at DESC LIMIT 30",
+            (user_id,),
+        ).fetchall()
+    status = _effective_presence(presence["status"], presence["last_seen"]) if presence else "offline"
+    result = {
+        "username": user["username"], "mace_id": user["mace_id"], "created_at": user["created_at"],
+        "avatar_url": None, "display_name": str(prof["display_name"] or ""), "bio": str(prof["bio"] or ""),
+        "minecraft_seconds": int(prof["minecraft_seconds"] or 0),
+        "minecraft_hours": round(int(prof["minecraft_seconds"] or 0) / 3600, 2),
+        "status": status, "game_version": str(presence["game_version"] or "") if presence else "",
+        "last_seen": int(presence["last_seen"] or 0) if presence else 0,
+        "screenshots": [_attachment_public(row) for row in shot_rows],
+    }
+    if include_email:
+        result["email"] = user["email"]
+    return result
+
+def _resolve_friend(db, user: dict, mace_id: str) -> dict:
+    target = _user_by_mace_id(db, mace_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Аккаунт с таким MaceId не найден.")
+    if int(target["id"]) == int(user["id"]):
+        raise HTTPException(status_code=400, detail="Нельзя отправлять сообщения самому себе.")
+    if _blocked_either_way(db, int(user["id"]), int(target["id"])):
+        raise HTTPException(status_code=403, detail="Взаимодействие с этим пользователем ограничено.")
+    if not _are_friends(db, int(user["id"]), int(target["id"])):
+        raise HTTPException(status_code=403, detail="Общаться и обмениваться файлами можно только с друзьями.")
+    return dict(target)
+
+def _safe_filename(name: str) -> str:
+    clean = Path(str(name or "file")).name.replace("\\", "_").replace("/", "_")
+    clean = re.sub(r"[^\w.() \-+\[\]]", "_", clean, flags=re.UNICODE).strip(" .")
+    return (clean or "file")[:180]
+
+async def _save_upload(upload: UploadFile, user_id: int, *, purpose: str, recipient_id: int | None, expires_at: int | None, max_bytes: int) -> dict:
+    if not upload or not upload.filename:
+        raise HTTPException(status_code=400, detail="Файл не выбран.")
+    original_name = _safe_filename(upload.filename)
+    content_type = (upload.content_type or mimetypes.guess_type(original_name)[0] or "application/octet-stream")[:160]
+    # Profile screenshots must really be images; chat accepts arbitrary files.
+    if purpose == "profile_screenshot" and not content_type.startswith("image/"):
+        raise HTTPException(status_code=415, detail="Для скриншота нужен файл изображения.")
+    file_id = uuid.uuid4().hex
+    try:
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        target = UPLOAD_DIR / f"{file_id}.bin"
+        total = 0
+        with target.open("wb") as out:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    out.close()
+                    target.unlink(missing_ok=True)
+                    raise HTTPException(status_code=413, detail=f"Файл слишком большой (лимит {max_bytes // (1024*1024)} МБ).")
+                out.write(chunk)
+        if total == 0:
+            target.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail="Файл пустой.")
+        with database() as db:
+            db.execute(
+                "INSERT INTO attachments(file_id,owner_id,recipient_id,purpose,original_name,content_type,file_size,stored_path,created_at,expires_at,deleted) VALUES (?,?,?,?,?,?,?,?,?,?,0)",
+                (file_id, int(user_id), recipient_id, purpose, original_name, content_type, total, str(target), utc_now(), expires_at),
+            )
+            row = db.execute("SELECT * FROM attachments WHERE file_id=?", (file_id,)).fetchone()
+        return _attachment_public(row)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        try:
+            (UPLOAD_DIR / f"{file_id}.bin").unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail=f"Не удалось сохранить файл: {type(exc).__name__}") from exc
+    finally:
+        try:
+            await upload.close()
+        except Exception:
+            pass
+
+def _insert_message(sender_id: int, recipient_id: int, text: str = "", attachment_id: str | None = None, message_type: str = "text") -> dict:
+    with database() as db:
+        cur = db.execute(
+            "INSERT INTO messages(sender_id,recipient_id,text,attachment_id,message_type,created_at) VALUES (?,?,?,?,?,?) RETURNING id",
+            (sender_id, recipient_id, text, attachment_id, message_type, utc_now()),
+        )
+        inserted = cur.fetchone()
+        message_id = int(inserted["id"] if isinstance(inserted, dict) or hasattr(inserted, "keys") else inserted[0])
+        return _message_by_id(db, message_id, sender_id)
+
+def _message_by_id(db, message_id: int, viewer_id: int) -> dict:
+    row = db.execute(
+        "SELECT m.*, su.username AS sender_username, su.mace_id AS sender_mace_id, ru.username AS recipient_username, a.file_id AS a_file_id, a.original_name AS a_original_name, a.content_type AS a_content_type, a.file_size AS a_file_size, a.purpose AS a_purpose, a.created_at AS a_created_at, a.expires_at AS a_expires_at, a.deleted AS a_deleted "
+        "FROM messages m JOIN users su ON su.id=m.sender_id JOIN users ru ON ru.id=m.recipient_id LEFT JOIN attachments a ON a.file_id=m.attachment_id WHERE m.id=?",
+        (int(message_id),),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Сообщение не найдено.")
+    keys = set(row.keys())
+    attachment = None
+    if row["a_file_id"]:
+        attachment = {"file_id": row["a_file_id"], "filename": row["a_original_name"], "content_type": row["a_content_type"],
+                      "file_size": int(row["a_file_size"] or 0), "purpose": row["a_purpose"], "created_at": row["a_created_at"],
+                      "expires_at": row["a_expires_at"], "expired": bool(row["a_deleted"]) or (row["a_expires_at"] is not None and int(row["a_expires_at"]) <= int(time.time())),
+                      "download_url": f"/files/{row['a_file_id']}" if not row["a_deleted"] and (row["a_expires_at"] is None or int(row["a_expires_at"]) > int(time.time())) else None}
+    elif row["attachment_id"]:
+        attachment = {"file_id": row["attachment_id"], "filename": "Файл удалён через час", "expired": True, "download_url": None}
+    return {"id": int(row["id"]), "text": str(row["text"] or ""), "sender_username": row["sender_username"],
+            "sender_mace_id": row["sender_mace_id"], "sender_id": int(row["sender_id"]), "recipient_id": int(row["recipient_id"]),
+            "is_mine": int(row["sender_id"]) == int(viewer_id), "message_type": row["message_type"],
+            "created_at": row["created_at"], "attachment": attachment, "attachment_id": row["attachment_id"]}
+
+def _cleanup_expired_uploads() -> int:
+    now = int(time.time())
+    with database() as db:
+        rows = db.execute("SELECT file_id,stored_path FROM attachments WHERE expires_at IS NOT NULL AND expires_at<=? AND deleted=0", (now,)).fetchall()
+        count = 0
+        for row in rows:
+            try:
+                if row["stored_path"]:
+                    Path(row["stored_path"]).unlink(missing_ok=True)
+            except OSError:
+                pass
+            db.execute("UPDATE attachments SET deleted=1,stored_path='' WHERE file_id=?", (row["file_id"],))
+            count += 1
+    return count
+
+def _cleanup_worker():
+    while True:
+        try:
+            _cleanup_expired_uploads()
+        except Exception as exc:
+            print(f"[MaceHost] Cleanup warning: {exc}")
+        time.sleep(60)
+
+@app.on_event("startup")
+def _start_upload_cleanup():
+    threading.Thread(target=_cleanup_worker, daemon=True, name="MaceUploadCleanup").start()
+
+@app.put("/profile")
+def update_profile(body: ProfileUpdateBody, user: dict = Depends(current_user)):
+    display_name = body.display_name.strip()[:32]
+    bio = body.bio.strip()[:240]
+    with database() as db:
+        _ensure_user_profile(db, int(user["id"]))
+        db.execute("UPDATE user_profiles SET display_name=?,bio=?,updated_at=? WHERE user_id=?", (display_name, bio, utc_now(), int(user["id"])))
+    return _profile_payload(user, include_email=True)
+
+@app.post("/presence")
+def update_presence(body: PresenceBody, user: dict = Depends(current_user)):
+    user_id = int(user["id"]); now = int(time.time())
+    status = body.status
+    if status == "minecraft" and not body.game_version.strip():
+        game_version = "Minecraft"
+    else:
+        game_version = body.game_version.strip()[:32]
+    with database() as db:
+        db.execute(
+            "INSERT INTO presence(user_id,status,last_seen,game_version) VALUES (?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET status=excluded.status,last_seen=excluded.last_seen,game_version=excluded.game_version",
+            (user_id, status, now, game_version),
+        )
+        _ensure_user_profile(db, user_id)
+        if body.playtime_delta and status == "minecraft":
+            db.execute("UPDATE user_profiles SET minecraft_seconds=minecraft_seconds+?,updated_at=? WHERE user_id=?", (min(60, int(body.playtime_delta)), utc_now(), user_id))
+    return {"ok": True, "status": status, "last_seen": now}
+
+@app.get("/profiles/{mace_id}")
+def get_public_profile(mace_id: str, user: dict = Depends(current_user)):
+    with database() as db:
+        target = _user_by_mace_id(db, mace_id)
+        if not target:
+            raise HTTPException(status_code=404, detail="Профиль не найден.")
+        if _blocked_either_way(db, int(user["id"]), int(target["id"])):
+            raise HTTPException(status_code=403, detail="Этот профиль недоступен.")
+    return _profile_payload(dict(target), include_email=False)
+
+@app.post("/profile/screenshots")
+async def upload_profile_screenshot(file: UploadFile = File(...), user: dict = Depends(current_user)):
+    attachment = await _save_upload(file, int(user["id"]), purpose="profile_screenshot", recipient_id=None, expires_at=None, max_bytes=15*1024*1024)
+    with database() as db:
+        db.execute("INSERT INTO profile_screenshots(user_id,attachment_id,created_at) VALUES (?,?,?)", (int(user["id"]), attachment["file_id"], utc_now()))
+    return {"ok": True, "screenshot": attachment}
+
+@app.delete("/profile/screenshots/{file_id}")
+def delete_profile_screenshot(file_id: str, user: dict = Depends(current_user)):
+    with database() as db:
+        row = db.execute("SELECT a.* FROM attachments a JOIN profile_screenshots s ON s.attachment_id=a.file_id WHERE a.file_id=? AND s.user_id=?", (file_id, int(user["id"]))).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Скриншот не найден.")
+        try:
+            if row["stored_path"]:
+                Path(row["stored_path"]).unlink(missing_ok=True)
+        except OSError:
+            pass
+        db.execute("DELETE FROM profile_screenshots WHERE attachment_id=? AND user_id=?", (file_id, int(user["id"])))
+        db.execute("DELETE FROM attachments WHERE file_id=?", (file_id,))
+    return {"ok": True}
+
+@app.post("/chats/{mace_id}/messages")
+def send_chat_message(mace_id: str, body: ChatMessageBody, user: dict = Depends(current_user)):
+    with database() as db:
+        target = _resolve_friend(db, user, mace_id)
+    message = _insert_message(int(user["id"]), int(target["id"]), body.text.strip(), None, "text")
+    return {"ok": True, "message": message}
+
+@app.get("/chats/{mace_id}/messages")
+def get_chat_messages(mace_id: str, limit: int = Query(default=50, ge=1, le=100), after_id: int = Query(default=0, ge=0), user: dict = Depends(current_user)):
+    with database() as db:
+        target = _resolve_friend(db, user, mace_id)
+        rows = db.execute(
+            "SELECT id FROM messages WHERE ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?)) AND id>? ORDER BY id DESC LIMIT ?",
+            (int(user["id"]), int(target["id"]), int(target["id"]), int(user["id"]), int(after_id), int(limit)),
+        ).fetchall()
+        ids = [int(r["id"] if hasattr(r, "keys") else r[0]) for r in rows]
+        ids.reverse()
+        messages = [_message_by_id(db, message_id, int(user["id"])) for message_id in ids]
+    return {"messages": messages, "next_after_id": max(ids, default=after_id)}
+
+@app.post("/chats/{mace_id}/files")
+async def send_chat_file(mace_id: str, file: UploadFile = File(...), user: dict = Depends(current_user)):
+    with database() as db:
+        target = _resolve_friend(db, user, mace_id)
+    expires = int(time.time()) + CHAT_FILE_LIFETIME_SECONDS
+    attachment = await _save_upload(file, int(user["id"]), purpose="chat", recipient_id=int(target["id"]), expires_at=expires, max_bytes=MAX_UPLOAD_BYTES)
+    ct = str(attachment.get("content_type") or "")
+    if ct.startswith("image/"):
+        kind = "image"
+    elif ct.startswith("audio/") or Path(str(attachment.get("filename") or "")).suffix.lower() in {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus"}:
+        kind = "audio"
+    else:
+        kind = "file"
+    message = _insert_message(int(user["id"]), int(target["id"]), "", attachment["file_id"], kind)
+    return {"ok": True, "message": message, "attachment": attachment, "delete_after_seconds": CHAT_FILE_LIFETIME_SECONDS}
+
+@app.get("/files/{file_id}")
+def download_social_file(file_id: str, user: dict = Depends(current_user)):
+    _cleanup_expired_uploads()
+    with database() as db:
+        row = db.execute("SELECT * FROM attachments WHERE file_id=?", (file_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Файл не найден.")
+        owner_id = int(row["owner_id"]); recipient_id = int(row["recipient_id"]) if row["recipient_id"] is not None else None
+        viewer_id = int(user["id"])
+        if row["purpose"] == "chat":
+            if viewer_id not in (owner_id, recipient_id):
+                raise HTTPException(status_code=403, detail="Нет доступа к этому файлу.")
+        elif row["purpose"] == "profile_screenshot":
+            pass
+        else:
+            raise HTTPException(status_code=404, detail="Файл не найден.")
+        if row["deleted"] or (row["expires_at"] is not None and int(row["expires_at"]) <= int(time.time())):
+            raise HTTPException(status_code=410, detail="Файл удалён с сервера спустя час после отправки.")
+        path = Path(row["stored_path"])
+        if not path.is_file():
+            raise HTTPException(status_code=410, detail="Файл больше недоступен на сервере.")
+        return FileResponse(path, media_type=row["content_type"], filename=row["original_name"], content_disposition_type="attachment")
+
+@app.delete("/friends/requests/{request_id}")
+def cancel_friend_request(request_id: int, user: dict = Depends(current_user)):
+    with database() as db:
+        row = db.execute("SELECT id FROM friend_requests WHERE id=? AND requester_id=? AND status='pending'", (int(request_id), int(user["id"]))).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Исходящая заявка не найдена.")
+        db.execute("UPDATE friend_requests SET status='cancelled',responded_at=? WHERE id=?", (utc_now(), int(request_id)))
     return {"ok": True}
 
 
