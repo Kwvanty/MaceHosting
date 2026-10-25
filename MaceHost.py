@@ -9,8 +9,10 @@ public address from mace_server.txt; that file is not used as the bind address.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
+import json
 import os
 import re
 import secrets
@@ -32,10 +34,14 @@ except ImportError:  # Optional locally; required when DATABASE_URL is PostgreSQ
     psycopg = None
     dict_row = None
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, UploadFile, File, Form
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+# Embedded relay: API and game traffic share the same hosting service/process.
+# MaceRelay.py must be deployed beside this file and websockets installed.
+from MaceRelay import MaceRelay
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
@@ -68,7 +74,7 @@ SESSION_SECONDS = 60 * 60 * 24 * 30
 app = FastAPI(
     title="MaceHost — Mace Accounts API",
     description="Unified accounts, profiles, friends, and Mace Social Worlds signaling for Mace Launcher.",
-    version="1.3.0",
+    version="1.4.0",
 )
 
 # Access tokens are sent explicitly as Bearer tokens; cookies are not used.
@@ -136,6 +142,140 @@ class WorldDecisionBody(BaseModel):
 WORLD_PRESENCE_SECONDS = 90
 WORLD_INVITATION_SECONDS = 90
 WORLD_LOADER_VALUES = {"auto", "vanilla", "fabric", "forge", "neoforge", "quilt", "unknown"}
+MACE_RELAY_URL = os.environ.get("MACE_RELAY_URL", "").strip().rstrip("/")
+# On Render, use the same public service URL automatically when no relay URL is set.
+# This keeps the API and WebSocket relay on one service/domain.
+if not MACE_RELAY_URL:
+    _render_external_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    if _render_external_url.startswith("https://"):
+        from urllib.parse import urlsplit
+        _render_host = urlsplit(_render_external_url).netloc
+        if _render_host:
+            MACE_RELAY_URL = f"wss://{_render_host}/worlds/relay"
+MACE_RELAY_SECRET = os.environ.get("MACE_RELAY_SECRET", "").strip()
+try:
+    MACE_RELAY_TICKET_SECONDS = max(300, min(86400, int(os.environ.get("MACE_RELAY_TICKET_SECONDS", "28800"))))
+except (TypeError, ValueError):
+    MACE_RELAY_TICKET_SECONDS = 28800
+
+
+class _StarletteWebSocketAdapter:
+    """Adapt FastAPI/Starlette WebSocket to the small interface MaceRelay uses."""
+    def __init__(self, websocket: WebSocket):
+        self.websocket = websocket
+
+    async def recv(self):
+        message = await self.websocket.receive()
+        if message.get("type") == "websocket.disconnect":
+            raise ConnectionError("WebSocket client disconnected")
+        if message.get("text") is not None:
+            return message["text"]
+        if message.get("bytes") is not None:
+            return message["bytes"]
+        raise ConnectionError("Empty WebSocket message")
+
+    async def send(self, message):
+        if isinstance(message, bytes):
+            await self.websocket.send_bytes(message)
+        else:
+            await self.websocket.send_text(str(message))
+
+    async def close(self, code=1000, reason=None):
+        try:
+            await self.websocket.close(code=int(code), reason=str(reason or ""))
+        except RuntimeError:
+            # Already closed by the ASGI server/client.
+            pass
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return await self.recv()
+        except (ConnectionError, WebSocketDisconnect, RuntimeError):
+            raise StopAsyncIteration
+
+
+_embedded_relay = MaceRelay(MACE_RELAY_SECRET) if len(MACE_RELAY_SECRET) >= 32 else None
+
+
+def _relay_is_configured() -> bool:
+    if len(MACE_RELAY_SECRET) < 32 or not MACE_RELAY_URL:
+        return False
+    from urllib.parse import urlsplit
+    parsed = urlsplit(MACE_RELAY_URL)
+    if parsed.scheme.lower() == "wss" and parsed.netloc:
+        return True
+    # Plain WebSocket is allowed only for localhost development.
+    return parsed.scheme.lower() == "ws" and (parsed.hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
+
+
+@app.websocket("/worlds/relay")
+async def embedded_relay_endpoint(websocket: WebSocket):
+    """Authenticated game relay hosted by the same process as the MaceHost API."""
+    if _embedded_relay is None or len(MACE_RELAY_SECRET) < 32:
+        await websocket.close(code=1013, reason="MaceRelay is not configured")
+        return
+    await websocket.accept()
+    await _embedded_relay.handler(_StarletteWebSocketAdapter(websocket))
+
+
+@app.get("/relay/health")
+def embedded_relay_health():
+    if _embedded_relay is None:
+        return {"ok": False, "service": "MaceRelay", "configured": False}
+    return {**_embedded_relay_health_snapshot(), "configured": True}
+
+
+def _embedded_relay_health_snapshot() -> dict:
+    relay = _embedded_relay
+    if relay is None:
+        return {"ok": False, "service": "MaceRelay"}
+    return {
+        "ok": True,
+        "service": "MaceRelay",
+        "uptime_seconds": max(0, int(time.time() - relay.started_at)),
+        "connected_agents": len(relay.connections),
+        "active_streams": len(relay.routes),
+        "active_sessions": len(relay.hosts),
+    }
+
+
+def _make_relay_ticket(session_id: str, user_id: int, role: str) -> Optional[str]:
+    """Issue a signed, short-lived capability ticket for the separate relay."""
+    if not _relay_is_configured():
+        return None
+    if role not in {"host", "join"}:
+        return None
+    payload = {
+        "v": 1,
+        "sid": str(session_id),
+        "uid": int(user_id),
+        "role": role,
+        "exp": int(time.time()) + MACE_RELAY_TICKET_SECONDS,
+        "nonce": secrets.token_urlsafe(18),
+    }
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    signature = hmac.new(MACE_RELAY_SECRET.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256).hexdigest()
+    return encoded + "." + signature
+
+
+def _host_transport_fields(session_id: str, user_id: int) -> dict:
+    ticket = _make_relay_ticket(session_id, user_id, "host")
+    if not ticket:
+        return {"transport_ready": False, "relay_url": "", "host_ticket": None}
+    return {"transport_ready": True, "relay_url": MACE_RELAY_URL, "host_ticket": ticket,
+            "ticket_expires_in_seconds": MACE_RELAY_TICKET_SECONDS}
+
+
+def _join_transport_fields(session_id: str, user_id: int) -> dict:
+    ticket = _make_relay_ticket(session_id, user_id, "join")
+    if not ticket:
+        return {"transport_ready": False, "relay_url": "", "join_ticket": None}
+    return {"transport_ready": True, "relay_url": MACE_RELAY_URL, "join_ticket": ticket,
+            "ticket_expires_in_seconds": MACE_RELAY_TICKET_SECONDS}
 
 
 def utc_now() -> str:
@@ -1029,8 +1169,8 @@ def _world_row_public(row):
         "expires_at": int(row["expires_at"] or 0),
         "host_mace_id": str(row["host_mace_id"] or "") if "host_mace_id" in keys else "",
         "host_username": str(row["host_username"] or "") if "host_username" in keys else "",
-        "transport_ready": False,
-        "transport_status": "signaling_only",
+        "transport_ready": _relay_is_configured(),
+        "transport_status": "relay_configured" if _relay_is_configured() else "relay_unconfigured",
     }
 
 
@@ -1073,8 +1213,11 @@ def create_world_session(body: WorldSessionCreateBody, user: dict = Depends(curr
             (session_id, int(user["id"]), title, version, loader, utc_now(), now, now + WORLD_PRESENCE_SECONDS),
         )
         row = db.execute("SELECT * FROM world_sessions WHERE session_id=?", (session_id,)).fetchone()
-    return {"ok": True, "session": _world_row_public(row), "heartbeat_interval_seconds": 30,
-            "note": "Сигнализация активна; сетевой транспорт Minecraft должен быть настроен отдельно."}
+    session_public = _world_row_public(row)
+    session_public.update(_host_transport_fields(session_id, int(user["id"])))
+    return {"ok": True, "session": session_public, "heartbeat_interval_seconds": 30,
+            "transport_ready": bool(session_public.get("transport_ready")),
+            "note": "Туннель доступен при настроенном MaceRelay; сначала откройте мир для LAN и укажите LAN-порт."}
 
 
 @app.get("/worlds/my-session")
@@ -1086,7 +1229,11 @@ def get_my_world_session(user: dict = Depends(current_user)):
             "SELECT * FROM world_sessions WHERE host_user_id=? AND status='active' AND expires_at>? ORDER BY created_at DESC LIMIT 1",
             (int(user["id"]), now),
         ).fetchone()
-        return {"session": _world_row_public(row) if row else None}
+        if not row:
+            return {"session": None, "transport_ready": _relay_is_configured()}
+        session_public = _world_row_public(row)
+        session_public.update(_host_transport_fields(str(row["session_id"]), int(user["id"])))
+        return {"session": session_public, "transport_ready": bool(session_public.get("transport_ready"))}
 
 
 @app.post("/worlds/sessions/{session_id}/heartbeat")
@@ -1140,7 +1287,7 @@ def list_friend_worlds(user: dict = Depends(current_user)):
             host_id = _user_by_mace_id(db, str(row["host_mace_id"] or ""))
             if host_id and not _blocked_either_way(db, int(user["id"]), int(host_id["id"])):
                 worlds.append(_world_row_public(row))
-    return {"worlds": worlds, "transport_ready": False}
+    return {"worlds": worlds, "transport_ready": _relay_is_configured()}
 
 
 @app.post("/worlds/sessions/{session_id}/invitations")
@@ -1202,8 +1349,13 @@ def respond_world_invitation(invitation_id: str, body: WorldDecisionBody, user: 
             db.execute("UPDATE world_invitations SET status=?,responded_at=? WHERE invitation_id=? AND status='pending'", (status, utc_now(), str(invitation_id)))
     if status == "expired":
         raise HTTPException(status_code=410, detail="Мир больше не опубликован.")
-    return {"ok": True, "status": status, "transport_ready": False,
-            "message": "Приглашение принято, но сетевой туннель ещё не настроен." if body.accept else "Приглашение отклонено."}
+    result = {"ok": True, "status": status, "transport_ready": False,
+              "message": "Приглашение принято." if body.accept else "Приглашение отклонено."}
+    if body.accept:
+        result.update(_join_transport_fields(str(row["session_id"]), int(user["id"])))
+        result["message"] = ("Приглашение принято; туннель можно запустить." if result.get("transport_ready")
+                             else "Приглашение принято, но MaceRelay ещё не настроен.")
+    return result
 
 
 @app.post("/worlds/sessions/{session_id}/join-requests")
@@ -1261,8 +1413,49 @@ def respond_world_join_request(request_id: str, body: WorldDecisionBody, user: d
             raise HTTPException(status_code=403, detail="Доступ запрещён: вы больше не друзья или один из аккаунтов заблокирован.")
         status = "accepted" if body.accept else "declined"
         db.execute("UPDATE world_join_requests SET status=?,responded_at=? WHERE request_id=? AND status='pending'", (status, utc_now(), str(request_id)))
-    return {"ok": True, "status": status, "transport_ready": False,
-            "message": "Запрос принят; ожидается настройка сетевого канала." if body.accept else "Запрос отклонён."}
+    result = {"ok": True, "status": status, "transport_ready": False,
+              "message": "Запрос принят." if body.accept else "Запрос отклонён."}
+    if body.accept:
+        # Ticket belongs to the requester, not the host who clicked Accept.
+        result.update(_join_transport_fields(str(row["session_id"]), int(row["requester_id"])))
+        result["message"] = ("Запрос принят; туннель можно запустить." if result.get("transport_ready")
+                             else "Запрос принят, но MaceRelay ещё не настроен.")
+    return result
+
+
+@app.post("/worlds/sessions/{session_id}/connect-ticket")
+def world_connect_ticket(session_id: str, user: dict = Depends(current_user)):
+    """Issue a fresh join ticket only after an invitation/request has been accepted."""
+    now = int(time.time())
+    requester_id = int(user["id"])
+    with database() as db:
+        _expire_world_signals(db, now)
+        session = db.execute(
+            "SELECT ws.*,u.mace_id AS host_mace_id FROM world_sessions ws JOIN users u ON u.id=ws.host_user_id "
+            "WHERE ws.session_id=? AND ws.status='active' AND ws.expires_at>?",
+            (str(session_id), now),
+        ).fetchone()
+        if not session:
+            raise HTTPException(status_code=404, detail="Мир больше не опубликован.")
+        host_id = int(session["host_user_id"])
+        if host_id == requester_id:
+            raise HTTPException(status_code=400, detail="Владелец мира не может получить билет гостя.")
+        if not _are_friends(db, requester_id, host_id) or _blocked_either_way(db, requester_id, host_id):
+            raise HTTPException(status_code=403, detail="Доступ разрешён только друзьям без блокировки.")
+        invited = db.execute(
+            "SELECT invitation_id FROM world_invitations WHERE session_id=? AND sender_id=? AND recipient_id=? AND status='accepted' LIMIT 1",
+            (str(session_id), host_id, requester_id),
+        ).fetchone()
+        requested = db.execute(
+            "SELECT request_id FROM world_join_requests WHERE session_id=? AND requester_id=? AND status='accepted' LIMIT 1",
+            (str(session_id), requester_id),
+        ).fetchone()
+        if not invited and not requested:
+            raise HTTPException(status_code=403, detail="Сначала дождитесь принятия приглашения или запроса на вход.")
+    result = _join_transport_fields(str(session_id), requester_id)
+    if not result.get("transport_ready"):
+        raise HTTPException(status_code=503, detail="MaceRelay ещё не настроен на сервере.")
+    return {"ok": True, **result}
 
 
 @app.get("/worlds/inbox")
@@ -1310,7 +1503,7 @@ def get_world_inbox(user: dict = Depends(current_user)):
         "join_requests": [base_signal(row, "join_request") for row in request_rows],
         "outgoing_requests": [base_signal(row, "join_request") for row in outgoing_request_rows],
         "outgoing_invitations": [base_signal(row, "invitation") for row in outgoing_invite_rows],
-        "transport_ready": False,
+        "transport_ready": _relay_is_configured(),
     }
 
 
