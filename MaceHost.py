@@ -67,8 +67,8 @@ SESSION_SECONDS = 60 * 60 * 24 * 30
 
 app = FastAPI(
     title="MaceHost — Mace Accounts API",
-    description="Unified accounts, profiles, and friends for Mace Launcher.",
-    version="1.2.0",
+    description="Unified accounts, profiles, friends, and Mace Social Worlds signaling for Mace Launcher.",
+    version="1.3.0",
 )
 
 # Access tokens are sent explicitly as Bearer tokens; cookies are not used.
@@ -117,6 +117,25 @@ class ProfileUpdateBody(BaseModel):
 
 class ChatMessageBody(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
+
+
+class WorldSessionCreateBody(BaseModel):
+    title: str = Field(default="Мир Minecraft", min_length=1, max_length=48)
+    minecraft_version: str = Field(default="", max_length=64)
+    loader: str = Field(default="auto", max_length=24)
+
+
+class WorldInviteBody(BaseModel):
+    mace_id: str = Field(min_length=3, max_length=40)
+
+
+class WorldDecisionBody(BaseModel):
+    accept: bool
+
+
+WORLD_PRESENCE_SECONDS = 90
+WORLD_INVITATION_SECONDS = 90
+WORLD_LOADER_VALUES = {"auto", "vanilla", "fabric", "forge", "neoforge", "quilt", "unknown"}
 
 
 def utc_now() -> str:
@@ -316,6 +335,49 @@ if _USE_POSTGRES:
 with database() as _db:
     _db.executescript(_SOCIAL_SCHEMA)
 
+# Mace Social Worlds: signaling and invitation state only. The actual Minecraft
+# traffic transport is deliberately separate from MaceHost's HTTPS API.
+_WORLD_SCHEMA = """
+CREATE TABLE IF NOT EXISTS world_sessions (
+    session_id TEXT PRIMARY KEY,
+    host_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    minecraft_version TEXT NOT NULL DEFAULT '',
+    loader TEXT NOT NULL DEFAULT 'auto',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    heartbeat_at BIGINT NOT NULL,
+    expires_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_world_sessions_host_status ON world_sessions(host_user_id, status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_world_sessions_active ON world_sessions(status, expires_at);
+CREATE TABLE IF NOT EXISTS world_invitations (
+    invitation_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES world_sessions(session_id) ON DELETE CASCADE,
+    sender_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    recipient_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    expires_at BIGINT NOT NULL,
+    responded_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_world_invitations_recipient ON world_invitations(recipient_id, status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_world_invitations_session ON world_invitations(session_id, status);
+CREATE TABLE IF NOT EXISTS world_join_requests (
+    request_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES world_sessions(session_id) ON DELETE CASCADE,
+    requester_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    expires_at BIGINT NOT NULL,
+    responded_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_world_join_requests_session ON world_join_requests(session_id, status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_world_join_requests_requester ON world_join_requests(requester_id, status, expires_at);
+"""
+with database() as _db:
+    _db.executescript(_WORLD_SCHEMA)
+
 if os.environ.get("MACE_UPLOAD_DIR"):
     UPLOAD_DIR = Path(os.environ["MACE_UPLOAD_DIR"]).expanduser()
 elif os.environ.get("PORT"):
@@ -411,7 +473,7 @@ def health():
     return {
         "ok": True,
         "service": "MaceHost",
-        "api_version": "1.2.0",
+        "api_version": "1.3.0",
         "database": "postgresql" if _USE_POSTGRES else "sqlite",
         "persistent_database": bool(_USE_POSTGRES or os.environ.get("MACE_ACCOUNTS_DB")),
     }
@@ -941,6 +1003,315 @@ def cancel_friend_request(request_id: int, user: dict = Depends(current_user)):
             raise HTTPException(status_code=404, detail="Исходящая заявка не найдена.")
         db.execute("UPDATE friend_requests SET status='cancelled',responded_at=? WHERE id=?", (utc_now(), int(request_id)))
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Mace Social Worlds — authenticated signaling and invite workflow.
+# These endpoints never expose a local IP address or claim that a transport
+# tunnel exists. A separate, verified transport layer must carry Minecraft TCP.
+# ---------------------------------------------------------------------------
+def _expire_world_signals(db, now=None):
+    now = int(now if now is not None else time.time())
+    db.execute("UPDATE world_sessions SET status='expired' WHERE status='active' AND expires_at<=?", (now,))
+    db.execute("UPDATE world_invitations SET status='expired',responded_at=? WHERE status='pending' AND expires_at<=?", (utc_now(), now))
+    db.execute("UPDATE world_join_requests SET status='expired',responded_at=? WHERE status='pending' AND expires_at<=?", (utc_now(), now))
+
+
+def _world_row_public(row):
+    keys = set(row.keys()) if hasattr(row, "keys") else set(row) if isinstance(row, dict) else set()
+    return {
+        "session_id": str(row["session_id"]),
+        "title": str(row["title"] or "Мир Minecraft"),
+        "minecraft_version": str(row["minecraft_version"] or ""),
+        "loader": str(row["loader"] or "auto"),
+        "status": str(row["status"] or "active"),
+        "created_at": str(row["created_at"] or ""),
+        "expires_at": int(row["expires_at"] or 0),
+        "host_mace_id": str(row["host_mace_id"] or "") if "host_mace_id" in keys else "",
+        "host_username": str(row["host_username"] or "") if "host_username" in keys else "",
+        "transport_ready": False,
+        "transport_status": "signaling_only",
+    }
+
+
+def _get_active_world_for_host(db, session_id, host_user_id, now=None):
+    now = int(now if now is not None else time.time())
+    row = db.execute(
+        "SELECT * FROM world_sessions WHERE session_id=? AND host_user_id=? AND status='active' AND expires_at>?",
+        (str(session_id), int(host_user_id), now),
+    ).fetchone()
+    return row
+
+
+@app.post("/worlds/sessions")
+def create_world_session(body: WorldSessionCreateBody, user: dict = Depends(current_user)):
+    now = int(time.time())
+    title = " ".join(str(body.title or "").split()).strip()[:48] or "Мир Minecraft"
+    version = " ".join(str(body.minecraft_version or "").split())[:64]
+    loader = str(body.loader or "auto").strip().lower()
+    if loader not in WORLD_LOADER_VALUES:
+        loader = "unknown"
+    session_id = uuid.uuid4().hex
+    with database() as db:
+        _expire_world_signals(db, now)
+        presence = db.execute("SELECT status,last_seen FROM presence WHERE user_id=?", (int(user["id"]),)).fetchone()
+        if not presence or _effective_presence(str(presence["status"] or "offline"), int(presence["last_seen"] or 0)) != "minecraft":
+            raise HTTPException(status_code=409, detail="Опубликовать мир можно только когда Mace Launcher видит активный Minecraft.")
+        # Only one advertised world per account. Older invitations/requests are
+        # cancelled atomically with the session replacement.
+        old_rows = db.execute(
+            "SELECT session_id FROM world_sessions WHERE host_user_id=? AND status='active'",
+            (int(user["id"]),),
+        ).fetchall()
+        for old in old_rows:
+            old_id = str(old["session_id"])
+            db.execute("UPDATE world_sessions SET status='closed' WHERE session_id=?", (old_id,))
+            db.execute("UPDATE world_invitations SET status='cancelled',responded_at=? WHERE session_id=? AND status='pending'", (utc_now(), old_id))
+            db.execute("UPDATE world_join_requests SET status='cancelled',responded_at=? WHERE session_id=? AND status='pending'", (utc_now(), old_id))
+        db.execute(
+            "INSERT INTO world_sessions(session_id,host_user_id,title,minecraft_version,loader,status,created_at,heartbeat_at,expires_at) VALUES (?,?,?,?,?,'active',?,?,?)",
+            (session_id, int(user["id"]), title, version, loader, utc_now(), now, now + WORLD_PRESENCE_SECONDS),
+        )
+        row = db.execute("SELECT * FROM world_sessions WHERE session_id=?", (session_id,)).fetchone()
+    return {"ok": True, "session": _world_row_public(row), "heartbeat_interval_seconds": 30,
+            "note": "Сигнализация активна; сетевой транспорт Minecraft должен быть настроен отдельно."}
+
+
+@app.get("/worlds/my-session")
+def get_my_world_session(user: dict = Depends(current_user)):
+    now = int(time.time())
+    with database() as db:
+        _expire_world_signals(db, now)
+        row = db.execute(
+            "SELECT * FROM world_sessions WHERE host_user_id=? AND status='active' AND expires_at>? ORDER BY created_at DESC LIMIT 1",
+            (int(user["id"]), now),
+        ).fetchone()
+        return {"session": _world_row_public(row) if row else None}
+
+
+@app.post("/worlds/sessions/{session_id}/heartbeat")
+def heartbeat_world_session(session_id: str, user: dict = Depends(current_user)):
+    now = int(time.time())
+    presence_valid = False
+    with database() as db:
+        row = _get_active_world_for_host(db, session_id, int(user["id"]), now)
+        if not row:
+            raise HTTPException(status_code=404, detail="Активная игровая сессия не найдена или истекла.")
+        presence = db.execute("SELECT status,last_seen FROM presence WHERE user_id=?", (int(user["id"]),)).fetchone()
+        presence_valid = bool(presence and _effective_presence(str(presence["status"] or "offline"), int(presence["last_seen"] or 0)) == "minecraft")
+        if not presence_valid:
+            db.execute("UPDATE world_sessions SET status='closed' WHERE session_id=?", (str(session_id),))
+            db.execute("UPDATE world_invitations SET status='cancelled',responded_at=? WHERE session_id=? AND status='pending'", (utc_now(), str(session_id)))
+            db.execute("UPDATE world_join_requests SET status='cancelled',responded_at=? WHERE session_id=? AND status='pending'", (utc_now(), str(session_id)))
+        else:
+            db.execute("UPDATE world_sessions SET heartbeat_at=?,expires_at=? WHERE session_id=?", (now, now + WORLD_PRESENCE_SECONDS, str(session_id)))
+    if not presence_valid:
+        raise HTTPException(status_code=409, detail="Minecraft больше не активен; публикация мира остановлена.")
+    return {"ok": True, "expires_at": now + WORLD_PRESENCE_SECONDS}
+
+
+@app.delete("/worlds/sessions/{session_id}")
+def close_world_session(session_id: str, user: dict = Depends(current_user)):
+    with database() as db:
+        row = db.execute("SELECT session_id FROM world_sessions WHERE session_id=? AND host_user_id=? AND status='active'", (str(session_id), int(user["id"]))).fetchone()
+        if not row:
+            # Idempotent close helps safe cleanup when a client is restarting.
+            return {"ok": True, "already_closed": True}
+        db.execute("UPDATE world_sessions SET status='closed' WHERE session_id=?", (str(session_id),))
+        db.execute("UPDATE world_invitations SET status='cancelled',responded_at=? WHERE session_id=? AND status='pending'", (utc_now(), str(session_id)))
+        db.execute("UPDATE world_join_requests SET status='cancelled',responded_at=? WHERE session_id=? AND status='pending'", (utc_now(), str(session_id)))
+    return {"ok": True, "already_closed": False}
+
+
+@app.get("/worlds")
+def list_friend_worlds(user: dict = Depends(current_user)):
+    now = int(time.time())
+    with database() as db:
+        _expire_world_signals(db, now)
+        rows = db.execute(
+            "SELECT ws.*,u.mace_id AS host_mace_id,u.username AS host_username "
+            "FROM world_sessions ws JOIN users u ON u.id=ws.host_user_id "
+            "JOIN friendships f ON ((f.user_a_id=? AND f.user_b_id=ws.host_user_id) OR (f.user_b_id=? AND f.user_a_id=ws.host_user_id)) "
+            "WHERE ws.status='active' AND ws.expires_at>? AND ws.host_user_id<>? ORDER BY ws.created_at DESC LIMIT 50",
+            (int(user["id"]), int(user["id"]), now, int(user["id"])),
+        ).fetchall()
+        worlds = []
+        for row in rows:
+            host_id = _user_by_mace_id(db, str(row["host_mace_id"] or ""))
+            if host_id and not _blocked_either_way(db, int(user["id"]), int(host_id["id"])):
+                worlds.append(_world_row_public(row))
+    return {"worlds": worlds, "transport_ready": False}
+
+
+@app.post("/worlds/sessions/{session_id}/invitations")
+def invite_friend_to_world(session_id: str, body: WorldInviteBody, user: dict = Depends(current_user)):
+    now = int(time.time())
+    recipient_mace_id = body.mace_id.strip()
+    invitation_id = uuid.uuid4().hex
+    with database() as db:
+        _expire_world_signals(db, now)
+        session = _get_active_world_for_host(db, session_id, int(user["id"]), now)
+        if not session:
+            raise HTTPException(status_code=404, detail="Сначала опубликуйте свой активный мир.")
+        target = _user_by_mace_id(db, recipient_mace_id)
+        if not target:
+            raise HTTPException(status_code=404, detail="Аккаунт друга не найден.")
+        recipient_id = int(target["id"])
+        sender_id = int(user["id"])
+        if recipient_id == sender_id:
+            raise HTTPException(status_code=400, detail="Нельзя пригласить самого себя.")
+        if not _are_friends(db, sender_id, recipient_id):
+            raise HTTPException(status_code=403, detail="Приглашать в мир можно только друзей Mace.")
+        if _blocked_either_way(db, sender_id, recipient_id):
+            raise HTTPException(status_code=403, detail="Приглашение недоступно: один из аккаунтов заблокирован.")
+        pending = db.execute(
+            "SELECT invitation_id FROM world_invitations WHERE session_id=? AND sender_id=? AND recipient_id=? AND status='pending' AND expires_at>? LIMIT 1",
+            (str(session_id), sender_id, recipient_id, now),
+        ).fetchone()
+        if pending:
+            return {"ok": True, "invitation_id": str(pending["invitation_id"]), "already_pending": True}
+        db.execute(
+            "INSERT INTO world_invitations(invitation_id,session_id,sender_id,recipient_id,status,created_at,expires_at,responded_at) VALUES (?,?,?,?,'pending',?,?,NULL)",
+            (invitation_id, str(session_id), sender_id, recipient_id, utc_now(), now + WORLD_INVITATION_SECONDS),
+        )
+    return {"ok": True, "invitation_id": invitation_id, "expires_in_seconds": WORLD_INVITATION_SECONDS}
+
+
+@app.post("/worlds/invitations/{invitation_id}/respond")
+def respond_world_invitation(invitation_id: str, body: WorldDecisionBody, user: dict = Depends(current_user)):
+    now = int(time.time())
+    with database() as db:
+        _expire_world_signals(db, now)
+        row = db.execute(
+            "SELECT wi.*,ws.status AS session_status,ws.expires_at AS session_expires FROM world_invitations wi "
+            "JOIN world_sessions ws ON ws.session_id=wi.session_id WHERE wi.invitation_id=? AND wi.recipient_id=?",
+            (str(invitation_id), int(user["id"])),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Приглашение не найдено.")
+        if str(row["status"]) != "pending":
+            raise HTTPException(status_code=409, detail="Приглашение уже обработано или истекло.")
+        session_available = str(row["session_status"]) == "active" and int(row["session_expires"] or 0) > now
+        if body.accept and session_available and (not _are_friends(db, int(user["id"]), int(row["sender_id"])) or _blocked_either_way(db, int(user["id"]), int(row["sender_id"]))):
+            raise HTTPException(status_code=403, detail="Доступ запрещён: вы больше не друзья или один из аккаунтов заблокирован.")
+        if not session_available:
+            db.execute("UPDATE world_invitations SET status='expired',responded_at=? WHERE invitation_id=?", (utc_now(), str(invitation_id)))
+            status = "expired"
+        else:
+            status = "accepted" if body.accept else "declined"
+            db.execute("UPDATE world_invitations SET status=?,responded_at=? WHERE invitation_id=? AND status='pending'", (status, utc_now(), str(invitation_id)))
+    if status == "expired":
+        raise HTTPException(status_code=410, detail="Мир больше не опубликован.")
+    return {"ok": True, "status": status, "transport_ready": False,
+            "message": "Приглашение принято, но сетевой туннель ещё не настроен." if body.accept else "Приглашение отклонено."}
+
+
+@app.post("/worlds/sessions/{session_id}/join-requests")
+def request_to_join_world(session_id: str, user: dict = Depends(current_user)):
+    now = int(time.time())
+    request_id = uuid.uuid4().hex
+    with database() as db:
+        _expire_world_signals(db, now)
+        session = db.execute(
+            "SELECT ws.*,u.mace_id AS host_mace_id FROM world_sessions ws JOIN users u ON u.id=ws.host_user_id "
+            "WHERE ws.session_id=? AND ws.status='active' AND ws.expires_at>?",
+            (str(session_id), now),
+        ).fetchone()
+        if not session:
+            raise HTTPException(status_code=404, detail="Этот мир уже недоступен.")
+        host_id = int(session["host_user_id"])
+        requester_id = int(user["id"])
+        if host_id == requester_id:
+            raise HTTPException(status_code=400, detail="Это ваш собственный мир.")
+        if not _are_friends(db, requester_id, host_id):
+            raise HTTPException(status_code=403, detail="Запросить доступ можно только к миру друга.")
+        if _blocked_either_way(db, requester_id, host_id):
+            raise HTTPException(status_code=403, detail="Запрос недоступен из-за блокировки.")
+        pending = db.execute(
+            "SELECT request_id FROM world_join_requests WHERE session_id=? AND requester_id=? AND status='pending' AND expires_at>? LIMIT 1",
+            (str(session_id), requester_id, now),
+        ).fetchone()
+        if pending:
+            return {"ok": True, "request_id": str(pending["request_id"]), "already_pending": True}
+        db.execute(
+            "INSERT INTO world_join_requests(request_id,session_id,requester_id,status,created_at,expires_at,responded_at) VALUES (?,?,?,'pending',?,?,NULL)",
+            (request_id, str(session_id), requester_id, utc_now(), now + WORLD_INVITATION_SECONDS),
+        )
+    return {"ok": True, "request_id": request_id, "expires_in_seconds": WORLD_INVITATION_SECONDS}
+
+
+@app.post("/worlds/join-requests/{request_id}/respond")
+def respond_world_join_request(request_id: str, body: WorldDecisionBody, user: dict = Depends(current_user)):
+    now = int(time.time())
+    with database() as db:
+        _expire_world_signals(db, now)
+        row = db.execute(
+            "SELECT jr.*,ws.status AS session_status,ws.host_user_id,ws.expires_at AS session_expires "
+            "FROM world_join_requests jr JOIN world_sessions ws ON ws.session_id=jr.session_id "
+            "WHERE jr.request_id=? AND ws.host_user_id=?",
+            (str(request_id), int(user["id"])),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Запрос на подключение не найден.")
+        if str(row["status"]) != "pending":
+            raise HTTPException(status_code=409, detail="Запрос уже обработан или истёк.")
+        if body.accept and (str(row["session_status"]) != "active" or int(row["session_expires"] or 0) <= now):
+            raise HTTPException(status_code=410, detail="Мир больше не опубликован.")
+        if body.accept and (not _are_friends(db, int(user["id"]), int(row["requester_id"])) or _blocked_either_way(db, int(user["id"]), int(row["requester_id"]))):
+            raise HTTPException(status_code=403, detail="Доступ запрещён: вы больше не друзья или один из аккаунтов заблокирован.")
+        status = "accepted" if body.accept else "declined"
+        db.execute("UPDATE world_join_requests SET status=?,responded_at=? WHERE request_id=? AND status='pending'", (status, utc_now(), str(request_id)))
+    return {"ok": True, "status": status, "transport_ready": False,
+            "message": "Запрос принят; ожидается настройка сетевого канала." if body.accept else "Запрос отклонён."}
+
+
+@app.get("/worlds/inbox")
+def get_world_inbox(user: dict = Depends(current_user)):
+    now = int(time.time())
+    viewer_id = int(user["id"])
+    with database() as db:
+        _expire_world_signals(db, now)
+        invitation_rows = db.execute(
+            "SELECT wi.*,ws.title,ws.minecraft_version,ws.loader,ws.session_id,ws.status AS session_status,"
+            "u.username AS sender_username,u.mace_id AS sender_mace_id "
+            "FROM world_invitations wi JOIN world_sessions ws ON ws.session_id=wi.session_id "
+            "JOIN users u ON u.id=wi.sender_id WHERE wi.recipient_id=? AND wi.status='pending' AND wi.expires_at>? AND ws.status='active' AND ws.expires_at>? "
+            "ORDER BY wi.created_at DESC LIMIT 20",
+            (viewer_id, now, now),
+        ).fetchall()
+        request_rows = db.execute(
+            "SELECT jr.*,ws.title,ws.minecraft_version,ws.loader,ws.session_id,u.username AS requester_username,u.mace_id AS requester_mace_id "
+            "FROM world_join_requests jr JOIN world_sessions ws ON ws.session_id=jr.session_id "
+            "JOIN users u ON u.id=jr.requester_id WHERE ws.host_user_id=? AND jr.status='pending' AND jr.expires_at>? AND ws.status='active' AND ws.expires_at>? "
+            "ORDER BY jr.created_at DESC LIMIT 20",
+            (viewer_id, now, now),
+        ).fetchall()
+        outgoing_request_rows = db.execute(
+            "SELECT jr.*,ws.title,ws.minecraft_version,ws.loader,u.username AS host_username,u.mace_id AS host_mace_id "
+            "FROM world_join_requests jr JOIN world_sessions ws ON ws.session_id=jr.session_id "
+            "JOIN users u ON u.id=ws.host_user_id WHERE jr.requester_id=? "
+            "ORDER BY jr.created_at DESC LIMIT 20",
+            (viewer_id,),
+        ).fetchall()
+        # Include a bounded history of our own invitations so hosts see whether
+        # friends accepted or declined them (pending invitations have deadlines).
+        outgoing_invite_rows = db.execute(
+            "SELECT wi.*,ws.title,ws.minecraft_version,ws.loader,u.username AS recipient_username,u.mace_id AS recipient_mace_id "
+            "FROM world_invitations wi JOIN world_sessions ws ON ws.session_id=wi.session_id "
+            "JOIN users u ON u.id=wi.recipient_id WHERE wi.sender_id=? ORDER BY wi.created_at DESC LIMIT 20",
+            (viewer_id,),
+        ).fetchall()
+    def base_signal(row, kind):
+        out = {key: (row[key] if key in row.keys() else None) for key in row.keys()}
+        out["kind"] = kind
+        return out
+    return {
+        "invitations": [base_signal(row, "invitation") for row in invitation_rows],
+        "join_requests": [base_signal(row, "join_request") for row in request_rows],
+        "outgoing_requests": [base_signal(row, "join_request") for row in outgoing_request_rows],
+        "outgoing_invitations": [base_signal(row, "invitation") for row in outgoing_invite_rows],
+        "transport_ready": False,
+    }
 
 
 if __name__ == "__main__":
