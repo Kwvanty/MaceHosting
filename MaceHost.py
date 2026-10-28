@@ -51,20 +51,26 @@ if DATABASE_URL and not _USE_POSTGRES:
 if _USE_POSTGRES and psycopg is None:
     raise RuntimeError("DATABASE_URL is set to PostgreSQL, but psycopg is missing. Install requirements.txt.")
 
-# Local development defaults to a database beside the source. On hosted runtimes
-# without DATABASE_URL, use /tmp so a read-only /app directory does not crash boot.
-# /tmp is ephemeral: use Hostless managed PostgreSQL + DATABASE_URL for real accounts.
+# Local development defaults to SQLite beside this file. On hosted runtimes,
+# use managed PostgreSQL (DATABASE_URL) or explicitly mount a persistent disk and
+# point MACE_ACCOUNTS_DB at it. Never silently store production accounts in /tmp.
 _configured_db_path = os.environ.get("MACE_ACCOUNTS_DB", "").strip()
 if _configured_db_path:
     DATABASE_PATH = Path(_configured_db_path).expanduser()
 elif os.environ.get("PORT") and not _USE_POSTGRES:
-    DATABASE_PATH = Path(os.environ.get("MACE_TEMP_DB_PATH", "/tmp/mace_accounts.db"))
-    warnings.warn(
-        "DATABASE_URL is not configured. MaceHost is using temporary SQLite at "
-        f"{DATABASE_PATH}; accounts may be lost after a restart or redeploy. "
-        "Connect a managed PostgreSQL database for persistent accounts.",
-        RuntimeWarning,
-    )
+    if os.environ.get("MACE_ALLOW_TEMP_SQLITE", "").strip() == "1":
+        DATABASE_PATH = Path(os.environ.get("MACE_TEMP_DB_PATH", "/tmp/mace_accounts.db"))
+        warnings.warn(
+            "MaceHost is using TEMPORARY SQLite. Accounts can be lost after restart/redeploy. "
+            "Use DATABASE_URL (managed PostgreSQL) or MACE_ACCOUNTS_DB on a persistent disk.",
+            RuntimeWarning,
+        )
+    else:
+        raise RuntimeError(
+            "Persistent account storage is not configured. Set DATABASE_URL to a managed "
+            "PostgreSQL database, or set MACE_ACCOUNTS_DB to a file on a persistent mounted disk. "
+            "For disposable local testing only, set MACE_ALLOW_TEMP_SQLITE=1."
+        )
 else:
     DATABASE_PATH = BASE_DIR / "mace_accounts.db"
 
@@ -123,6 +129,23 @@ class ProfileUpdateBody(BaseModel):
 
 class ChatMessageBody(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
+    reply_to_id: Optional[int] = Field(default=None, ge=1)
+
+
+class EditChatMessageBody(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+
+
+class PinChatMessageBody(BaseModel):
+    pinned: bool = True
+
+
+class ChatReactionBody(BaseModel):
+    emoji: str = Field(min_length=1, max_length=16)
+
+
+class ForwardChatMessageBody(BaseModel):
+    target_mace_id: str = Field(min_length=3, max_length=40)
 
 
 class WorldSessionCreateBody(BaseModel):
@@ -475,6 +498,43 @@ if _USE_POSTGRES:
 with database() as _db:
     _db.executescript(_SOCIAL_SCHEMA)
 
+# Schema migrations for richer chat actions. Existing accounts and messages are kept.
+def _ensure_message_action_schema() -> None:
+    with database() as db:
+        if _USE_POSTGRES:
+            rows = db.execute("SELECT column_name FROM information_schema.columns WHERE table_name=?", ("messages",)).fetchall()
+            columns = {str(row["column_name"]) for row in rows}
+            definitions = {
+                "edited_at": "TEXT",
+                "pinned": "BOOLEAN NOT NULL DEFAULT FALSE",
+                "reply_to_id": "BIGINT",
+                "forwarded_from_id": "BIGINT",
+            }
+        else:
+            rows = db.execute("PRAGMA table_info(messages)").fetchall()
+            columns = {str(row["name"]) for row in rows}
+            definitions = {
+                "edited_at": "TEXT",
+                "pinned": "INTEGER NOT NULL DEFAULT 0",
+                "reply_to_id": "INTEGER",
+                "forwarded_from_id": "INTEGER",
+            }
+        for column, definition in definitions.items():
+            if column not in columns:
+                db.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
+        db.executescript("""
+            CREATE TABLE IF NOT EXISTS message_reactions (
+                message_id BIGINT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                emoji TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(message_id, user_id, emoji)
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_reactions_message ON message_reactions(message_id);
+        """)
+
+_ensure_message_action_schema()
+
 # Mace Social Worlds: signaling and invitation state only. The actual Minecraft
 # traffic transport is deliberately separate from MaceHost's HTTPS API.
 _WORLD_SCHEMA = """
@@ -615,7 +675,7 @@ def health():
         "service": "MaceHost",
         "api_version": "1.3.0",
         "database": "postgresql" if _USE_POSTGRES else "sqlite",
-        "persistent_database": bool(_USE_POSTGRES or os.environ.get("MACE_ACCOUNTS_DB")),
+        "persistent_database": bool(_USE_POSTGRES or os.environ.get("MACE_ACCOUNTS_DB") or not os.environ.get("PORT")),
     }
 
 
@@ -958,11 +1018,11 @@ async def _save_upload(upload: UploadFile, user_id: int, *, purpose: str, recipi
         except Exception:
             pass
 
-def _insert_message(sender_id: int, recipient_id: int, text: str = "", attachment_id: str | None = None, message_type: str = "text") -> dict:
+def _insert_message(sender_id: int, recipient_id: int, text: str = "", attachment_id: str | None = None, message_type: str = "text", reply_to_id: int | None = None, forwarded_from_id: int | None = None) -> dict:
     with database() as db:
         cur = db.execute(
-            "INSERT INTO messages(sender_id,recipient_id,text,attachment_id,message_type,created_at) VALUES (?,?,?,?,?,?) RETURNING id",
-            (sender_id, recipient_id, text, attachment_id, message_type, utc_now()),
+            "INSERT INTO messages(sender_id,recipient_id,text,attachment_id,message_type,created_at,reply_to_id,forwarded_from_id) VALUES (?,?,?,?,?,?,?,?) RETURNING id",
+            (sender_id, recipient_id, text, attachment_id, message_type, utc_now(), reply_to_id, forwarded_from_id),
         )
         inserted = cur.fetchone()
         message_id = int(inserted["id"] if isinstance(inserted, dict) or hasattr(inserted, "keys") else inserted[0])
@@ -985,10 +1045,28 @@ def _message_by_id(db, message_id: int, viewer_id: int) -> dict:
                       "download_url": f"/files/{row['a_file_id']}" if not row["a_deleted"] and (row["a_expires_at"] is None or int(row["a_expires_at"]) > int(time.time())) else None}
     elif row["attachment_id"]:
         attachment = {"file_id": row["attachment_id"], "filename": "Файл удалён через час", "expired": True, "download_url": None}
+    reply = None
+    reply_id = row["reply_to_id"] if "reply_to_id" in keys else None
+    if reply_id:
+        reply_row = db.execute(
+            "SELECT m.id,m.text,u.username AS sender_username FROM messages m JOIN users u ON u.id=m.sender_id WHERE m.id=?",
+            (int(reply_id),),
+        ).fetchone()
+        if reply_row:
+            reply = {"id": int(reply_row["id"]), "text": str(reply_row["text"] or "")[:180], "sender_username": str(reply_row["sender_username"] or "")}
+    reactions_rows = db.execute(
+        "SELECT emoji,COUNT(*) AS count FROM message_reactions WHERE message_id=? GROUP BY emoji ORDER BY emoji",
+        (int(row["id"]),),
+    ).fetchall()
+    my_reactions = [str(r["emoji"]) for r in db.execute("SELECT emoji FROM message_reactions WHERE message_id=? AND user_id=?", (int(row["id"]), int(viewer_id))).fetchall()]
     return {"id": int(row["id"]), "text": str(row["text"] or ""), "sender_username": row["sender_username"],
             "sender_mace_id": row["sender_mace_id"], "sender_id": int(row["sender_id"]), "recipient_id": int(row["recipient_id"]),
             "is_mine": int(row["sender_id"]) == int(viewer_id), "message_type": row["message_type"],
-            "created_at": row["created_at"], "attachment": attachment, "attachment_id": row["attachment_id"]}
+            "created_at": row["created_at"], "edited_at": row["edited_at"] if "edited_at" in keys else None,
+            "pinned": bool(row["pinned"]) if "pinned" in keys else False, "reply_to_id": int(reply_id) if reply_id else None,
+            "reply_to": reply, "forwarded_from_id": int(row["forwarded_from_id"]) if "forwarded_from_id" in keys and row["forwarded_from_id"] else None,
+            "reactions": [{"emoji": str(r["emoji"]), "count": int(r["count"] or 0)} for r in reactions_rows],
+            "my_reactions": my_reactions, "attachment": attachment, "attachment_id": row["attachment_id"]}
 
 def _cleanup_expired_uploads() -> int:
     now = int(time.time())
@@ -1078,9 +1156,20 @@ def delete_profile_screenshot(file_id: str, user: dict = Depends(current_user)):
 
 @app.post("/chats/{mace_id}/messages")
 def send_chat_message(mace_id: str, body: ChatMessageBody, user: dict = Depends(current_user)):
+    text_value = body.text.strip()
+    if not text_value:
+        raise HTTPException(status_code=422, detail="Сообщение не может быть пустым.")
     with database() as db:
         target = _resolve_friend(db, user, mace_id)
-    message = _insert_message(int(user["id"]), int(target["id"]), body.text.strip(), None, "text")
+        reply_to_id = body.reply_to_id
+        if reply_to_id is not None:
+            reply_row = db.execute(
+                "SELECT id FROM messages WHERE id=? AND ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?))",
+                (int(reply_to_id), int(user["id"]), int(target["id"]), int(target["id"]), int(user["id"])),
+            ).fetchone()
+            if not reply_row:
+                raise HTTPException(status_code=404, detail="Сообщение для ответа не найдено в этом чате.")
+    message = _insert_message(int(user["id"]), int(target["id"]), text_value, None, "text", reply_to_id=reply_to_id)
     return {"ok": True, "message": message}
 
 @app.get("/chats/{mace_id}/messages")
@@ -1095,6 +1184,67 @@ def get_chat_messages(mace_id: str, limit: int = Query(default=50, ge=1, le=100)
         ids.reverse()
         messages = [_message_by_id(db, message_id, int(user["id"])) for message_id in ids]
     return {"messages": messages, "next_after_id": max(ids, default=after_id)}
+
+@app.put("/chats/{mace_id}/messages/{message_id}")
+def edit_chat_message(mace_id: str, message_id: int, body: EditChatMessageBody, user: dict = Depends(current_user)):
+    text_value = body.text.strip()
+    if not text_value:
+        raise HTTPException(status_code=422, detail="Сообщение не может быть пустым.")
+    with database() as db:
+        target = _resolve_friend(db, user, mace_id)
+        row = db.execute("SELECT * FROM messages WHERE id=? AND sender_id=? AND recipient_id=? AND message_type='text'", (int(message_id), int(user["id"]), int(target["id"]))).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Можно изменять только собственные текстовые сообщения.")
+        db.execute("UPDATE messages SET text=?,edited_at=? WHERE id=?", (text_value[:2000], utc_now(), int(message_id)))
+        return {"ok": True, "message": _message_by_id(db, int(message_id), int(user["id"]))}
+
+
+@app.post("/chats/{mace_id}/messages/{message_id}/pin")
+def pin_chat_message(mace_id: str, message_id: int, body: PinChatMessageBody, user: dict = Depends(current_user)):
+    with database() as db:
+        target = _resolve_friend(db, user, mace_id)
+        row = db.execute("SELECT id FROM messages WHERE id=? AND ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?))", (int(message_id), int(user["id"]), int(target["id"]), int(target["id"]), int(user["id"]))).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Сообщение не найдено в этом чате.")
+        db.execute("UPDATE messages SET pinned=? WHERE id=?", (bool(body.pinned), int(message_id)))
+        return {"ok": True, "message": _message_by_id(db, int(message_id), int(user["id"]))}
+
+
+@app.put("/chats/{mace_id}/messages/{message_id}/reactions")
+def toggle_chat_reaction(mace_id: str, message_id: int, body: ChatReactionBody, user: dict = Depends(current_user)):
+    allowed_emojis = {"👍", "❤️", "😂", "😮", "😢", "🎉", "🔥", "👀", "✅", "💀"}
+    emoji = str(body.emoji or "").strip()
+    if emoji not in allowed_emojis:
+        raise HTTPException(status_code=422, detail="Эта реакция не поддерживается.")
+    with database() as db:
+        target = _resolve_friend(db, user, mace_id)
+        row = db.execute("SELECT id FROM messages WHERE id=? AND ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?))", (int(message_id), int(user["id"]), int(target["id"]), int(target["id"]), int(user["id"]))).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Сообщение не найдено в этом чате.")
+        existing = db.execute("SELECT 1 FROM message_reactions WHERE message_id=? AND user_id=? AND emoji=?", (int(message_id), int(user["id"]), emoji)).fetchone()
+        if existing:
+            db.execute("DELETE FROM message_reactions WHERE message_id=? AND user_id=? AND emoji=?", (int(message_id), int(user["id"]), emoji))
+            enabled = False
+        else:
+            db.execute("INSERT INTO message_reactions(message_id,user_id,emoji,created_at) VALUES (?,?,?,?)", (int(message_id), int(user["id"]), emoji, utc_now()))
+            enabled = True
+        return {"ok": True, "enabled": enabled, "message": _message_by_id(db, int(message_id), int(user["id"]))}
+
+
+@app.post("/chats/{mace_id}/messages/{message_id}/forward")
+def forward_chat_message(mace_id: str, message_id: int, body: ForwardChatMessageBody, user: dict = Depends(current_user)):
+    with database() as db:
+        source_friend = _resolve_friend(db, user, mace_id)
+        source = db.execute("SELECT * FROM messages WHERE id=? AND ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?))", (int(message_id), int(user["id"]), int(source_friend["id"]), int(source_friend["id"]), int(user["id"]))).fetchone()
+        if not source:
+            raise HTTPException(status_code=404, detail="Исходное сообщение не найдено в этом чате.")
+        target_friend = _resolve_friend(db, user, body.target_mace_id)
+    text_value = str(source["text"] or "").strip()
+    if not text_value:
+        raise HTTPException(status_code=400, detail="Пересылка вложений пока не поддерживается; можно пересылать текстовые сообщения.")
+    forwarded = _insert_message(int(user["id"]), int(target_friend["id"]), text_value[:2000], None, "text", forwarded_from_id=int(message_id))
+    return {"ok": True, "message": forwarded, "target_mace_id": str(target_friend["mace_id"])}
+
 
 @app.post("/chats/{mace_id}/files")
 async def send_chat_file(mace_id: str, file: UploadFile = File(...), user: dict = Depends(current_user)):
